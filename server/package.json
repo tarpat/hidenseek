@@ -1,0 +1,28 @@
+{
+  "name": "hidenseek-server",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Hide n Seek game server (phase 0 spike)",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test test/engine.test.ts test/stats.test.ts test/integration.test.ts",
+    "test:unit": "tsx --test test/engine.test.ts test/stats.test.ts",
+    "bot": "tsx scripts/bot.ts"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.12",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}

@@ -1,0 +1,21 @@
+# Render Blueprint for the Hide n Seek server (free tier). Verify current options on Render's docs.
+services:
+  - type: web
+    name: hidenseek-server
+    runtime: node
+    plan: free
+    rootDir: server
+    # --include=dev because the TypeScript compiler is a dev dependency and Render may set NODE_ENV=production during install
+    buildCommand: npm ci --include=dev && npm run build
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_VERSION
+        value: 22
+      # Key for encrypting the restart snapshots that the phones hold. Generated once and kept across deploys.
+      # If it changes, games in progress can't be restored after a restart.
+      - key: SNAPSHOT_SECRET
+        generateValue: true
+      # Free key from developers.giphy.com. Without it the GIF button shows "GIFs aren't available".
+      - key: GIPHY_API_KEY
+        sync: false
