@@ -1,529 +1,483 @@
-# Hide n Seek — Requirements & Architecture
+# Hide n Seek: Design & Architecture
 
-A location-based, real-world hide-and-seek / tag game for iOS, in the style of Manhunt / Scram.
+A real-world, location-based hide-and-seek game for iPhone, in the style of Manhunt and Scram. This document describes the system **as built**: what it does, how it's put together, why the main choices were made, and what is still unverified or not built. For setup and usage, see [README.md](README.md).
 
-> **Status:** planning doc, revision 6.
-> **Key decisions:**
-> - Friends-only, ≈20 concurrent players, iOS 17+.
-> - **No paid Apple account**: the app is sideloaded to friends' phones (§8).
-> - **No sign-in**: the profile is stored on-device only.
-> - Backend on **Render's free tier**: in-memory game state over WebSockets. **No database.** Restart recovery uses encrypted snapshots held on the players' own phones (§6.6).
-> - Bundle ID: `com.tarunpatanjali.hidenseek`.
-> - **Chat and media live on the phones.** The server only relays them transiently in memory. Photos and videos are sent **losslessly** (no recompression).
-> - Hiders get a **5-minute head start**. After that, and every 5 minutes, a ping shows **everyone's location to everyone**. All timings are configurable.
-> - **Live speed and route tracking**, with an end-of-game results map (§3.9).
->
-> Free-tier limits are from memory and change often. Items marked ⚠️ should be re-checked before relying on them.
+**Scope.** Friends only, about 20 players at a time (soft cap 50). iOS 17 or later. Runs on free services. No App Store release: the app is sideloaded with a free Apple ID.
 
----
+**Contents**
 
-## 1. Game Overview
-
-Players join a game with a code. The leader draws a circular play area (geofence) on a map and assigns roles. Hiders get a **5-minute head start** (configurable) to hide. When it ends, and every **5 minutes** after that (configurable), a "ping" shows **everyone's location to everyone**. Seekers hunt hiders on foot. When a seeker physically tags a hider, the seeker marks it in the app and the hider becomes a seeker. The hunt lasts **30 minutes** (configurable), starting when the head start ends, or until every hider has been tagged. Throughout, the app tracks everyone's speed and route, and the end screen shows each player's path and stats on a map.
-
-**Win conditions**
-- Seekers win: all hiders converted before the timer expires.
-- Hiders win: at least one hider remains when the timer expires.
-
-**Scope assumptions**
-- Audience: a group of friends. Design target ≈ 20 concurrent players, soft cap ~50.
-- Distribution: sideloaded builds (no App Store, no TestFlight).
-- Platform: iOS 17+ only.
+1. [Game rules](#1-game-rules)
+2. [Requirements and status](#2-requirements-and-status)
+3. [Architecture](#3-architecture)
+4. [Server design](#4-server-design)
+5. [iOS app design](#5-ios-app-design)
+6. [Hosting, distribution and cost](#6-hosting-distribution-and-cost)
+7. [Privacy and safety](#7-privacy-and-safety)
+8. [Testing and verification](#8-testing-and-verification)
+9. [Design decisions](#9-design-decisions)
+10. [Known limitations and unverified assumptions](#10-known-limitations-and-unverified-assumptions)
 
 ---
 
-## 2. Roles
+## 1. Game rules
 
-| Role | Description |
+### 1.1 Roles
+
+| Role | What they can do |
 |---|---|
-| **Leader (host)** | Creates the game and has full control over settings and roles. Can edit settings before and during the game. Can play as a hider or seeker, or act as a **referee** who sees everything but doesn't play. |
-| **Seeker** | Sees seekers' live locations, plus everyone's location at each ping. Can tag hiders. |
-| **Hider** | Sees other hiders' live locations, plus everyone's location at each ping. |
+| **Leader** | Creates the game and controls roles and rules before and during play. Can play as a hider or seeker, or act as a **referee** who sees everyone and doesn't play. If the leader is disconnected for 2 minutes, the longest-present connected player becomes leader. |
+| **Seeker** | Hunts hiders and can tag them. |
+| **Hider** | Hides. Can mark themselves tagged. |
 
-Tagged hiders become seekers. There is no elimination, so nobody sits out.
+A tagged hider becomes a seeker. There is no elimination, so nobody sits out.
 
----
+### 1.2 Flow of a game
 
-## 3. Functional Requirements
+1. A player creates a game and gets a **6-character code** (alphabet without `0 O 1 I L`) and an invite link `hidenseek://join/CODE`. Others join with it. No sign-in.
+2. In the **lobby** the leader assigns roles (manually or randomly), sets the play area, and tunes the rules. A game can't start until everyone has a role and there's at least one hider and one seeker.
+3. **Head start** (5 minutes by default): hiders hide, seekers wait. Tagging is disabled.
+4. The **hunt** (30 minutes by default) starts when the head start ends. The total game is head start plus hunt, 35 minutes with defaults.
+5. **Pings:** the first fires when the head start ends, then one every 5 minutes. At every ping, **everyone receives everyone's position** as of that moment. With defaults that is at 5, 10, 15, 20, 25 and 30 minutes, and the game ends at 35. If the head start is 0, the first ping fires after one interval.
+6. A seeker who catches a hider in person taps **Tag**. There is no location or proximity check. Hiders may also tag themselves ("I'm out"), and the leader can force a hider to become a seeker.
+7. The game ends when **every hider is tagged** (seekers win) or **time runs out** with at least one hider free (hiders win), or the leader ends it.
+8. A **results** screen shows routes, stats and awards. The server then deletes the game.
 
-### 3.1 Identity & Profile (no sign-in)
-- **FR-1** There are **no accounts, emails, passwords, or sign-in screens**. The user opens the app, sets a name and optional profile picture, and joins or creates a game.
-- **FR-2** The profile (display name, avatar image, preferred color) is **stored on-device only** (UserDefaults for name/color, an app-container file for the image). It persists between games and is editable from a Profile screen.
-- **FR-3** On joining a game, the app sends the name, color, and a **downscaled avatar (~128×128 px, ≤ ~20 KB)** to the server so other players can see it. The server holds the avatar **in memory for the life of that game only**. It's never written to disk, it's excluded from restart snapshots, and it's discarded at cleanup (§3.11).
-- **FR-4** Anonymous identity:
-  - On first launch the app generates a random **device ID** (UUID, kept in Keychain).
-  - Joining a game returns a **per-game secret token**. The app stores it locally and presents it on every connection.
-  - If the app crashes, is killed, or the network drops, the token lets the player **rejoin as the same person** with the same role.
-
-### 3.2 Game Creation & Joining
-- **FR-5** Leader creates a game and gets a **6-character join code**. The alphabet excludes look-alike characters (no `0/O`, `1/I/L`). The code can be shared as a link using the custom URL scheme `hidenseek://join/ABC123` (universal links need a paid account), as text, or as a QR code.
-- **FR-6** Anyone with the code can join. A soft cap (e.g. 50) protects the free server.
-- **FR-7** A lobby shows who has joined, live. The leader can kick players. Players can leave.
-- **FR-8** Late join is allowed during an active game (leader setting). Late joiners enter as seekers or hiders per a leader setting.
-
-### 3.3 Role Assignment
-- **FR-9** **Manual:** the leader taps players to assign Seeker or Hider.
-- **FR-10** **Random:** the leader picks the number (or percentage) of seekers and taps "Randomize". The server does the shuffle.
-- **FR-11** **Self-select** *(optional)*: players pick their own role in the lobby.
-- **FR-12** Roles can be re-assigned before the game starts. During a game, the leader can manually change any player's role.
-
-### 3.4 Geofence (Play Area)
-- **FR-13** The leader sets a **circle**: center (drop pin, search an address, or "use my location") plus a radius slider (50 m to several km). The circle is drawn on the map for all players.
-- **FR-14** The geofence can be moved or resized **during** the game.
-- **FR-15** **Out-of-bounds flow:**
-  1. The server detects the player outside the circle.
-  2. **Everyone** gets a one-time ping with that player's current location, shown as an "out of bounds" event.
-  3. **Hiders:** the offender gets a loud warning and a **60-second countdown** (configurable). If they re-enter in time, the countdown cancels. If not, they are **auto-converted to a seeker** and everyone is notified.
-  4. **Seekers:** the same ping and warning happen, but there's no conversion (they're already seekers). A leader setting can disable seeker warnings.
-- **FR-16** Players get a warning as they approach the edge (for example within 20 m).
-- **FR-17** GPS-noise tolerance. A player counts as outside only if `distance − horizontalAccuracy > radius` for 2 consecutive samples. This prevents unfair conversions from GPS jitter.
-
-### 3.5 Timer, Head Start & Pings
-- **FR-18** The hunt lasts **30 minutes** by default (configurable). The 30 minutes **start after the head start ends**, so with defaults a game runs 35 minutes in total: 5 minutes of hiding, then 30 minutes of hunting. `endsAt = startsAt + headStart + duration`. A countdown is shown to all players, first for the head start and then for the hunt.
-- **FR-19** **Head start:** when the leader starts the game, hiders get a **5-minute head start** (configurable, 0 allowed) to hide. During it, seekers see a "Hiders are hiding" countdown and only their teammates on the map. Hiders see their fellow hiders live. Nobody sees the other side yet. **Tagging is disabled until the head start ends.**
-- **FR-20** **First ping** fires when the head start ends. After that a ping fires **every 5 minutes** (configurable). If the head start is 0, the first ping fires after one interval.
-- **FR-21** **At every ping, everyone receives everyone's location**: seekers get all hiders' and all seekers' positions, and hiders get all seekers' and all hiders' positions. The ping is a timestamped snapshot, so it's drawn as "as of" pins that stay on the map until the next ping.
-- **FR-22** Pings are server-driven and timestamped, so everyone sees the same moment. The UI shows "Next ping in mm:ss" and "Ping #N, 2 min ago". The leader can trigger a manual ping, pause or resume the game, or end it early. Pausing shifts all timers by the paused time.
-
-**Example timeline (defaults):** `0:00` start and head start begins → `5:00` hunt begins and ping #1 fires → `10:00` ping #2 → `15:00` → `20:00` → `25:00` → `30:00` ping #6 → `35:00` game ends.
-
-### 3.6 Map & Visibility Rules
+### 1.3 Visibility
 
 | Viewer | Live between pings | At each ping |
 |---|---|---|
-| **Seeker** | Seekers (self and teammates) | Everyone's position (as of the ping time) |
-| **Hider** | Hiders (self and teammates) | Everyone's position (as of the ping time) |
-| **Leader as referee** | Everyone | n/a |
+| Seeker | Seekers (self and teammates) | Everyone, as of that moment |
+| Hider | Hiders (self and teammates) | Everyone, as of that moment |
+| Referee | Everyone | n/a |
 
-- **FR-23** These rules are enforced **server-side**, per connection: between pings the server never sends a client the other side's positions. Hiding it in the UI alone isn't enough, because a modified client or a network sniffer could read it. At a ping, the full set is sent to everybody.
-- **FR-24** A player converted to a seeker gets the **seeker view only** from that moment on. Between pings they see only seekers live, and their hider-only chat history is hidden (FR-33).
-- **FR-25** Older pings show faded, with an age label. Out-of-bounds events are drawn distinctly.
-- **FR-26** The map uses native MapKit with the geofence overlay, a "center on me" button, and the player's own live route trail. A stale-signal indicator shows if a player's location is older than N seconds.
+A player converted to a seeker gets the seeker view only from then on. Their hiders-channel chat history is hidden until the game ends. After the game ends, everyone's live data and full routes are visible to everyone.
 
-### 3.7 Tagging
-- **FR-27** A seeker taps **Tag**, picks the hider from the list, and confirms. The hider is converted to a seeker immediately, and everyone gets a notification. **No location or proximity check is applied.**
-- **FR-28** Hiders can also **self-report** being tagged ("I'm out"). The leader can override: tag or un-tag anyone.
+Live **speed** follows the same rule as live location: a hider can't see seekers' speeds and vice versa, until the game ends. Teammates' speeds can be turned off by the leader.
 
-### 3.8 Chat
-- **FR-29** Real-time chat inside every game with **three channels**: *Everyone*, *Seekers only*, *Hiders only*. The server relays each message only to players whose **current role** may read that channel.
-- **FR-30** Message types: text, photos, GIFs, videos. System messages (tags, pings, out-of-bounds) are also posted.
-- **FR-31** **Chat and media are held on the devices, not on the server.** The server is a relay. It keeps a message or file in memory only until every authorized recipient has received it (or a short timeout passes: ~10 min for text, ~20 min for media), then discards it. Nothing is written to disk, nothing is kept in restart snapshots, and there is no server-side chat history. The sender keeps an outbox and re-sends anything the server hasn't acknowledged.
-- **FR-32** **Lossless only.** Photos and videos are sent exactly as captured, with **no resizing, no transcoding, and no quality reduction**.
-  - The only changes allowed are lossless ones: stripping **GPS/location metadata** (so a photo can't give away a hiding spot) without re-encoding the image or video, and transport compression (gzip) of text.
-  - **Photos** are sent as the original HEIC/JPEG (typically 2–5 MB). There is no size limit in the app.
-  - **Videos** have **no length or size limit** in the app and are never recompressed. Videos recorded inside the app use iOS's "high quality" camera setting (the simple camera API has no explicit 1080p option), and clips picked from the library are sent as they are. Clips picked from the library are sent as they are. The only ceiling is a high **server safety limit** (§7.5) that exists to protect the free server.
-  - **GIFs** are GIPHY URLs and are cached on the device once viewed.
-- **FR-33** Each phone stores its chat history and received media **locally** per game. Unread badges show per channel. When a player is converted to a seeker, the hiders' channel history is **hidden in the app** until the game ends, and then it reappears. Chat history is saved with Past games (FR-46) and can be deleted. Typing indicators, reactions, and report/mute are later additions.
+### 1.4 Play area (geofence)
 
-### 3.9 Speed, Route Tracking & Results Map  *(new)*
+A circle: center and radius (10 m to 50 km on the server; the app's slider offers 50 m to 3 km). It can be moved or resized during the game.
 
-**Live during the game**
-- **FR-34** The app continuously records each player's **position, speed, and timestamp** into a track, at up to ~1 sample/second while a game is active.
-- **FR-35** The HUD shows the player's own **current speed**, **distance covered**, and live route trail. Default unit is mph with a km/h toggle.
-- **FR-36** Teammates' live speeds (hiders see hiders, seekers see seekers) may appear in the roster. **Speed visibility follows the same visibility rules as location (§3.6).** Seekers can't see hiders' live speed. Stats for everyone are revealed at the end.
+- A player counts as **outside** only after **two consecutive** samples where `distance − accuracy > radius`, so GPS noise near the edge doesn't cause false alarms.
+- When that happens, **everyone gets an alert with that player's current location**.
+- **Hiders** then have a grace period (60 s by default) to come back. If they do, the alert is cleared. If not, they become seekers.
+- **Seekers** get the alert and warning only. They are never converted. The leader can turn seeker warnings off.
+- If no center is set, the geofence is simply off.
 
-**Gap-free tracking**
-- **FR-37** The phone keeps the **full-resolution track locally** and uploads it in numbered batches (every ~10 s over the same socket). The server acknowledges the highest sequence number it has stored. Unacknowledged batches are kept and re-sent after a dropout, a reconnect, or a server restart. This fills dead-zone gaps and keeps the results map accurate even when the live connection was spotty.
-- **FR-38** Live gameplay (pings, out-of-bounds) uses a separate lightweight `location` message every ~3–5 s while moving. While stationary (when CoreLocation sends no new fixes), the app re-sends its last fix as a **keepalive at least every ~15 s**, which the dark-hider rule relies on. Track batches don't need to be real-time.
+### 1.5 Offline hiders
 
-**Stat definitions**
-- **FR-39** Samples are filtered before computing stats:
-  - Drop samples with horizontal accuracy worse than ~25 m.
-  - Drop samples whose implied speed exceeds a sanity cap (~12 m/s, or ~27 mph), which are GPS glitches.
-  - Ignore movement below ~3 m between consecutive samples when stationary, so GPS jitter doesn't inflate distance.
-  - Speed comes from CoreLocation's speed when available and valid, otherwise from distance over time. It's smoothed with a short moving average.
-- **FR-40** Per-player stats shown at the end:
-  - **Total distance**
-  - **Top speed** (from smoothed speed)
-  - **Average moving speed** and **moving vs. still time**
-  - **Time survived** (hiders) and **tags made** (seekers)
-  - **Distance as hider vs. as seeker** for players who were converted
-  - A **speed-over-time chart** (Swift Charts) with markers for pings, tags, and out-of-bounds events
-- **FR-41** Fun awards computed from the stats, for example *Fastest*, *Marathoner* (farthest), *Statue* (least movement among hiders), *Last one standing*, *Top tagger*. A leader setting can turn them off.
+A hider who sends no location for 2 minutes (airplane mode, killed app, no location permission) is converted to a seeker. This closes the loophole of going dark to avoid pings. The setting is configurable and 0 turns it off. The app re-sends its last fix at least every 15 seconds so a hider standing still in a hiding spot isn't mistaken for offline. After a server restart or a pause, these timers are reset so nobody is converted because of downtime.
 
-**End-of-game results map**
-- **FR-42** After the game, a results screen shows a **map with every player's route superimposed**, one color per player with their avatar at the end point.
-  - Toggle players on/off, or filter to hiders or seekers.
-  - Speed-colored routes: a gradient from slow to fast.
-  - Overlays: the geofence circle, ping locations, tag locations, and out-of-bounds events.
-  - Start and end pins for each route.
-- **FR-43** **Replay scrubber** *(not in v1; static routes are enough for now)*: a time slider that plays the game back, with dots moving along each route and the clock and role changes shown. The full-resolution tracks are kept so this can be added later.
-- **FR-44** The tapped player's card shows their personal stats (FR-40) and highlights their route.
-- **FR-45** Full tracks for everyone are revealed to everyone **only after the game ends**, so hiding spots are no longer secret.
-- **FR-46** Results are **saved on-device** in a local "Past games" list, so they remain after the server deletes the game (§3.11). This fits the device-only data model. Players can delete past results.
+### 1.6 Leader settings
 
-### 3.10 Leader Settings
-All of these are editable **before and during** the game, with changes broadcast live.
+All editable before and during the game. The server clamps values to sane ranges and drops unknown keys.
 
 | Setting | Default | Notes |
 |---|---|---|
-| Hunt duration | 30 min | Counted from the end of the head start. Changing mid-game adjusts the end time |
-| Ping interval | 5 min | The first ping fires when the head start ends |
-| Geofence center / radius | set by leader | |
-| Out-of-bounds grace period | 60 s | |
-| Warn seekers who leave the area | On | Ping and warning only |
-| Role assignment | Manual | Manual / random / self-select |
-| Seeker count (random) | 1 per 6 players | |
-| Head start for hiders | 5 min | Hiders hide, and seekers wait. 0 is allowed |
-| Hider self-report tag | On | |
-| Auto-convert hiders who go dark | On, after 2 min | A hider with no location update for this long (airplane mode, app killed) is converted to a seeker. 0 = off |
-| Allow late join | On | |
-| Chat enabled / media allowed | On | |
-| Show seekers each other's live location | On | |
-| Show live speed to teammates | On | |
-| End-of-game awards | On | |
-| Units | mph | mph / km/h |
+| Head start | 5 min | 0 to 60 min |
+| Hunt length | 30 min | Counted after the head start. Changing it mid-game moves the end time |
+| Ping interval | 5 min | |
+| Out-of-bounds grace | 60 s | |
+| Warn seekers who leave the area | on | Warning only |
+| Convert offline hiders after | 2 min | 0 = never |
+| Hiders can tag themselves | on | |
+| Allow joining after start | on | Late joiners become seekers or hiders per setting (default seekers) |
+| Seekers see each other live | on | |
+| Show teammates' speed | on | |
+| Chat / photos and videos | on / on | |
+| End-of-game awards | on | |
+| Play area center and radius | unset / 500 m | Set from a map |
 
-### 3.11 Notifications & Cleanup
-- **FR-47** In-app banners, sounds, and haptics for: ping arrived, someone tagged, out-of-bounds, time warnings (10 min, 5 min, 1 min), and game over.
-- **FR-48** **Local notifications** when the app is backgrounded. These need no server or paid account.
-- **FR-49** Remote push (APNs) is **not available** without a paid Apple account. The app relies on its background-location session to stay connected (§7.2).
-- **FR-50** When a game ends, the server keeps it for about **30 minutes** so everyone can fetch the results payload and late reconnects work. Then it **deletes everything**: locations, tracks, avatars, and any undelivered chat or media. Phones delete their stored restart snapshots when the game ends (§6.6). Games with no connections for 30 min are deleted too.
-- **FR-51** **Save media to your Photos library at the end.** When the game ends, the results screen asks: *"Save N photos and M videos from this game to your Photos library?"*
-  - It includes **photos and videos only. GIFs are excluded.**
-  - The media goes into a new album named "Hide n Seek – <date>", in full original quality, and uses **add-only** Photos permission (the app can't read the rest of the library).
-  - It saves everything this phone received or sent, including media from channels the player could read at the time. Media from a team-only channel is therefore saved only by that team's phones.
-  - The same option stays available from the game's entry in Past games, so a player can say "not now" and save later. A game's media is never saved twice. The **"Automatically save photos & videos to Photos"** toggle in the app's Settings page (off by default, a per-device setting stored locally) skips the prompt and saves straight away.
+The leader can also pause and resume (all timers shift by the paused time), trigger an immediate ping, force a hider to become a seeker, change anyone's role, and remove players.
 
----
+### 1.7 Stats and awards
 
-## 4. Non-Functional Requirements
+Each phone records its own route (position, speed, accuracy, timestamp) at up to about 1 sample per second while the game is active.
 
-- **Battery:** continuous GPS is the main cost. Use `distanceFilter` ≈ 5 m, with high accuracy only in active games. Slow `location` uploads when stationary, but **never less than one keepalive every ~15 s**. Otherwise a hider sitting still in a hiding spot would look "dark" and get converted. Warn players to start with a charged phone, and suggest low-power-friendly settings.
-- **Latency:** live location updates visible within ~2–3 s. Pings fire within ~2 s of the scheduled time.
-- **Background operation:** location must keep reporting with the screen locked (§7.2).
-- **Resilience:** the app auto-reconnects with the saved token and shows "reconnecting". The server is authoritative, and a reconnecting client receives a full state sync. Track data is backed by local buffering (FR-37).
-- **Fairness:** the server, not clients, decides pings, geofence violations, and timer expiry.
-- **Privacy:** see §10.
-- **Accessibility:** Dynamic Type, VoiceOver labels on map pins and buttons, and color-blind-safe role colors.
+Samples are cleaned before any stat is computed:
+- Drop fixes with accuracy worse than 25 m.
+- Drop jumps implying more than 12 m/s (about 27 mph), which are GPS glitches. After 5 consecutive drops the reference point resets so a real relocation isn't stuck.
+- Ignore movement under 3 m between samples, so GPS jitter while standing still doesn't add distance.
+- Speed uses CoreLocation's speed when valid, otherwise distance over time, smoothed with a 3-point average. "Moving" means above 0.5 m/s. Gaps longer than 30 s count as "no data", not "still".
+
+Per-player stats: total distance (split into hider and seeker distance for converted players), top speed, average moving speed, moving versus still time, time survived (hiders), tags made, and a downsampled speed-over-time series. Awards: Fastest, Marathoner (farthest), Statue (least movement among hiders), Last one standing, Top tagger.
 
 ---
 
-## 5. Architecture Overview
+## 2. Requirements and status
 
-```
-┌─────────────────────────── iOS App (SwiftUI) ────────────────────────────┐
-│  Profile · past games · chat & media (all local)   CoreLocation   MapKit  │
-│  Track buffer · encrypted snapshot (local)   Swift Charts   Chat UI       │
-│  URLSessionWebSocketTask                                                  │
-└───────────┬───────────────────────────────────────────────────────────────┘
-            │  wss:// (JSON messages) + a few HTTPS endpoints
-┌───────────▼─────────────── Render Free Web Service ───────────────────────┐
-│  Node.js / TypeScript (or Go) single process                              │
-│   Game registry (Map<code, Game>)  ← all live state in memory             │
-│   Tick loop: pings, OOB timers, game end                                  │
-│   viewFor(game, player): per-connection visibility filter                 │
-│   Track store + stats calculator                                          │
-│   Snapshot encrypter / restorer (AES-GCM, key in Render env var)          │
-│   Chat/media relay (transient, capped) · GIF proxy · /health              │
-└───────────────────────────────────────────────────────────────────────────┘
-        ▲ the server periodically pushes an encrypted snapshot blob to every
-        │ client. Phones store it, but cannot read it. After a restart the
-        │ phones hand the newest blob back and the game resumes (§6.6).
-        External: GIPHY API (GIFs) · Apple MapKit (maps, free)
-```
-
-**Core idea:** a small stateful server. Each active game is an object in memory. Clients hold a WebSocket open and send location updates, track batches, and commands. The server validates them, updates state, and pushes only the allowed view to each client. Whenever game state changes meaningfully, the server sends every client an **encrypted snapshot** of the game. The phones keep it, so a restarted server can recover the game from them. There is no database.
+| Area | Requirement | Status |
+|---|---|---|
+| Identity | No sign-in. Name, color, photo stored on the phone only. Per-game secret token allows rejoining as the same player | Built |
+| Joining | Codes, share links, rejoin after crash or signal loss, soft cap of 50 players | Built |
+| Roles | Manual, random, referee, leader hand-over | Built |
+| Play area | Circle, live edit, noise-tolerant out-of-bounds flow | Built |
+| Timing | Head start, pings to everyone, pause/resume, manual ping, configurable | Built |
+| Visibility | Enforced per player on the server | Built |
+| Tagging | Seeker tag, hider self-tag, leader override | Built |
+| Tracking | Live speed and distance, full routes, gap-free upload | Built |
+| Results | Routes map, speed chart, stats, awards, saved on-device | Built |
+| Chat | Three channels, text, photos, videos, GIFs, on-device storage | Built |
+| Media | Lossless, GPS stripped, no app-side size limit, save to Photos at the end | Built |
+| Resilience | Restart recovery from encrypted snapshots held on the phones | Built |
+| Settings page | Units (mph/km/h), auto-save media, profile, server address | Built |
+| Past games | Saved on-device, deletable | Built |
+| Notifications | Local notifications and haptics for pings, tags, out-of-bounds, chat | Built |
+| Replay scrubber | Animated playback of a finished game | Not built (routes are kept at full resolution so it can be added) |
+| Players pick their own role | Optional lobby mode | Not built |
+| Live Activities | Countdown on the lock screen and Dynamic Island | Not built |
+| Chat backfill | Phones syncing missed messages from each other | Not built (decided against) |
+| Push (APNs), TestFlight, App Store | Need a paid Apple account | Out of scope |
 
 ---
 
-## 6. Server Design
+## 3. Architecture
 
-### 6.1 In-Memory Model (sketch)
-
-```ts
-Game {
-  code, status,                 // lobby | active | paused | ended
-  leaderId, leaderIsReferee,
-  createdAt, startsAt, endsAt, nextPingAt, pingSeq,
-  epoch, snapshotVersion,       // epoch increments on every restore
-  center: {lat, lng}, radiusM,
-  settings: { ... },            // everything from §3.10
-  players: Map<playerId, Player>,
-  pings: Ping[],                // snapshots, each tagged with the role it's visible to
-  events: Event[],              // tagged, oob_start, oob_return, oob_converted, settings, ...
-  relay: Map<msgId, {envelope, media?: Buffer, pendingRecipients, expiresAt}>
-                                // transient, capped, deleted once delivered or expired
-}
-
-Player {
-  id, tokenHash, displayName, color, avatar?,   // avatar in memory only, never snapshotted
-  role,                         // hider | seeker | referee
-  roleHistory: [{role, from}],  // for per-role stats
-  isLeader, joinedAt, connected, socket?,
-  lastLocation: {lat, lng, accuracyM, speed, at},
-  oobSince?, oobStrikes,
-  convertedAt?, convertedBy?,
-  track: { points: Float32/packed array [t, lat, lng, speed, acc], lastSeq }
-}
+```
+┌──────────────────── iPhone (SwiftUI, iOS 17+) ────────────────────┐
+│  GameClient        connection, state, tracking, chat, snapshots   │
+│  LocationService   CoreLocation with background updates           │
+│  Local stores      profile · chat + media · route · snapshot ·    │
+│                    results (all on the phone only)                │
+└───────────────┬───────────────────────────────────────────────────┘
+                │ wss:// JSON (game)        https:// (media, GIF search)
+┌───────────────▼────────────── Render free web service ────────────┐
+│  Node 22 + TypeScript, single process, no database                │
+│                                                                   │
+│  app.ts     WebSocket commands · HTTP endpoints · timers          │
+│  room.ts    a game room: members, chat/media relay, snapshots     │
+│  engine.ts  pure rules: roles, pings, geofence, tags, visibility  │
+│  stats.ts   route cleaning, stats, simplification, awards         │
+└───────────────────────────────────────────────────────────────────┘
+        External: GIPHY API (via the server) · Apple MapKit (free)
 ```
 
-**Track memory budget:** 20 players × 1 Hz × 30 min = 36,000 points. At ~24–40 bytes each that's ~1–1.5 MB, which is trivial for a 512 MB instance.
+### Core design ideas
 
-### 6.2 Messages (WebSocket, JSON)
+1. **The server is the referee.** Phones send locations and commands. The server validates them, runs the clock, and sends each player only the view they're allowed to see. Clients never decide pings, geofence violations, or timer expiry.
+2. **No database.** Each active game is an object in memory. It is deleted about 30 minutes after it ends (or after 30 minutes with nobody connected).
+3. **The phones are the backup.** Whenever the game changes meaningfully, the server sends every phone an encrypted snapshot only the server can read. After a restart, phones hand it back and the game resumes (section 4.7).
+4. **Chat and media live on the phones.** The server is a short-lived relay that forgets a message once everyone has it.
+5. **A pure rules engine.** `engine.ts` has no sockets or timers. Time and randomness are injected, so the rules are tested with a fake clock.
 
-**Client → server**
+### Why a custom server instead of a backend-as-a-service
+
+A game with roles, hidden information, timers, and per-player filtered views fits an authoritative server better than database rules plus a scheduler. One small Node process handles all of it, and its single thread processes commands one at a time, so two simultaneous tags can't race. See the decisions in section 9.
+
+---
+
+## 4. Server design
+
+### 4.1 Files
+
+| File | Responsibility |
+|---|---|
+| `src/engine.ts` | `GameEngine`: players, roles, settings, head start, pings, geofence, tagging, pause, win conditions, visibility (`viewFor`), serialization for snapshots |
+| `src/room.ts` | `Room` (members, sockets, chat and media relay), `Registry` (create, find, restore, sweep), snapshot encryption |
+| `src/app.ts` | WebSocket message handling, HTTP routes, the 1-second tick loop, results timing, restore handling, rate limiting |
+| `src/stats.ts` | Route cleaning, per-player stats, route simplification, speed series, awards, the results payload |
+| `src/index.ts` | Starts the server on `PORT` |
+
+### 4.2 Rules engine
+
+`GameEngine` holds the game status (`lobby`, `active`, `ended`), settings, players, pings, and an event log. Key behaviors:
+
+- `start()` requires a hider, a seeker, and no unassigned players. It computes `huntStartsAt = start + headStart` and `endsAt = huntStartsAt + duration`.
+- `tick()` (about once per second) converts hiders past their out-of-bounds grace, converts offline hiders, fires a ping when due, and checks win conditions. If it's late (for example after a restart), missed pings collapse into one.
+- `onLocation()` stores the position and applies the geofence rules.
+- `viewFor(playerId)` is the only way game data reaches a client (section 4.4).
+- `toJSON()` / `fromJSON()` serialize the game for snapshots. `resetTimersAfterRestore()` restarts the dark-hider and out-of-bounds timers.
+
+### 4.3 Protocol
+
+Game traffic is JSON over a WebSocket at `/ws`. Media and GIFs use HTTP.
+
+**Client to server**
 
 | Message | Purpose |
 |---|---|
-| `join {code, name, color, avatar, deviceId}` / `rejoin {code, token, snapshotVersion}` | Enter or resume a game. The server replies with `token` and a full state sync. If it doesn't know the game (it restarted), it replies `need_restore` |
-| `restore {code, version, blob}` | Hand the server an encrypted snapshot so it can rebuild a game after a restart (§6.6) |
-| `location {lat, lng, acc, speed, ts}` | Lightweight live position, every ~3–5 s |
-| `track_batch {from, points[]}` | Track history starting at point index `from`, every ~10 s. The server appends what it's missing and replies `track_ack {epoch, count}` with how many points it holds, and the phone resumes from there. This makes re-uploading after a restart idempotent |
-| `assign_roles`, `set_role` | Leader only |
-| `start_game`, `pause`, `resume`, `end_game`, `manual_ping` | Leader only |
-| `update_settings {patch}` / `set_geofence {lat, lng, radius}` | Leader only |
-| `tag {hiderId}` / `self_tagged` | Tagging (no proximity check) |
-| `chat {id, channel, kind, body, media?}` | The server checks the channel against the sender's role, relays it to authorized recipients, and acks the sender. Media goes up as a binary upload (or chunked frames) |
-| `chat_received {id}` | Recipient ack. Once all recipients ack, the server discards the message and media |
-| `kick {playerId}` / `leave` | Membership |
-| `get_results` | Fetch the final results payload |
+| `create`, `join {code}` | Start or join a game. Carry `name`, `color`, and a small base64 `avatar` |
+| `rejoin {code, token}` | Resume as the same player |
+| `restore {code, token, version, blob}` | Hand the server an encrypted snapshot after a restart |
+| `location {lat, lng, acc, speed}` | Live position, about every 3 s while moving and at least every 15 s otherwise |
+| `track_batch {from, points}` | Route history starting at point index `from`. The server replies `track_ack {epoch, count}` |
+| `track_done` | The phone has uploaded its full route after the game ended |
+| `set_role`, `assign_random`, `update_settings`, `set_geofence` | Leader only |
+| `start`, `end`, `pause`, `resume`, `manual_ping`, `force_seeker`, `kick` | Leader only |
+| `tag {hiderId}`, `self_tag` | Tagging |
+| `chat {id, channel, kind, body, mediaId, mime, size}`, `chat_received {id}` | Send a message and acknowledge one |
+| `set_avatar`, `get_results`, `leave`, `ping` | Misc |
 
-**Server → client**
-`state_sync`, `snapshot {version, blob}`, `need_restore`, `player_joined`/`left`, `role_changed`, `settings_changed`, `locations` (live teammates, including speed per the rules), `ping {seq, positions}`, `oob_warning`, `oob_event`, `tagged`, `chat`, `media_ready`, `track_ack`, `game_over`, `results`, `error`.
+**Server to client**
 
-### 6.3 Server Logic
-
-- **Tick loop** (≈1 s):
-  1. If `now ≥ nextPingAt`: snapshot **all** players' last known positions into one ping and send it to **everyone**. Then advance `nextPingAt` by the interval. At game start, `nextPingAt = startsAt + headStart` (or `startsAt + interval` if the head start is 0). `endsAt = startsAt + headStart + duration`.
-  2. For each player with `oobSince`: if the role is hider and `now − oobSince ≥ grace`, convert to seeker and emit events.
-  3. If `now ≥ endsAt` or no hiders remain: end the game, compute stats and the winner, send `game_over` and the results, and schedule cleanup.
-- **`location` handling:** store the position, then run the geofence check. Use haversine, which is plain math. Apply the 2-consecutive-sample and accuracy rule (FR-17). On the first confirmed exit, set `oobSince` and broadcast the `oob_event` with the position to everyone. Clear `oobSince` on re-entry.
-- **`track_batch` handling:** append points in order (skip duplicates by sequence number), update `lastSeq`, and ack.
-- **Chat relay:** accept an envelope, check the sender's role and channel, queue it for each authorized recipient currently or soon-to-be connected, and drop it on delivery acks or expiry. Enforce the per-file and total buffer caps (§7.5).
-- **Stats calculator:** runs once at game end on the stored tracks (FR-39, FR-40). It outputs per-player stats, awards, and a **simplified polyline** (Ramer–Douglas–Peucker) for rendering. The full-resolution data is also kept for the replay scrubber.
-- **Command validation:** every command checks the sender's token, role, and the game state. All mutations run synchronously on the single Node thread, so there are no race conditions such as two simultaneous tags.
-- **Leader loss:** if the leader is disconnected longer than N minutes, auto-promote another player.
-- **Clock:** the server sends `ends_at` and `next_ping_at` as absolute timestamps plus its current time. Clients compute a clock offset and render countdowns locally.
-
-### 6.4 Visibility Enforcement (anti-cheat)
-- There is **one function** that builds the outgoing payload for a player: `viewFor(game, player)`. All `state_sync` and broadcast messages go through it.
-- **Between pings**, seekers receive seeker live positions and speeds, and the roster (names, roles, counts).
-- **Between pings**, hiders receive hider live positions and speeds, and the roster.
-- **At a ping**, everyone receives every player's position. Speeds are not included in pings.
-- A referee receives everything.
-- Chat messages are fan-out filtered by channel and current role.
-- When a role changes (for example a tag), the server immediately sends the affected player a fresh filtered `state_sync`. The converted player gets **seeker view only** from then on.
-- Full tracks and stats are only sent after the game ends.
-- Never include fields in a payload "just in case". If the app doesn't receive hider coordinates, it can't leak them.
-
-### 6.5 Join Tokens & Abuse Protection
-- Tokens are random 128-bit values, and the server stores only a hash. A token is valid for one game.
-- Rate-limit joins per IP and per code, cap message sizes, and cap total players and avatar/media sizes.
-- Join codes are random enough (31⁶ ≈ 887 M combinations) that guessing is impractical, but also lock out an IP after repeated failures.
-- All traffic is TLS (Render provides HTTPS/WSS automatically).
-
-### 6.6 Restart Recovery via On-Device Snapshots
-Render can restart a free instance at any time, wiping memory. Instead of an external database, **the players' phones hold the backup**.
-
-**Saving**
-- Whenever state changes meaningfully (join/leave, role change, tag, ping, settings or geofence change, game start/pause/end, out-of-bounds conversion) and at least every ~60 s, the server builds a snapshot and sends it to **every connected client** as `snapshot {version, blob}`. `version` is a monotonically increasing counter.
-- **Contents:** settings, geofence, timers (as absolute timestamps), players (names, colors, roles, role history, token hashes), pings, and events.
-- **Not included:** avatars, **chat and media** (they live on the devices), and **tracks**. Each phone already holds its own full track locally (FR-37). Last-known live locations aren't needed either, because phones resend them within seconds of reconnecting.
-- **Size:** a compressed snapshot should be roughly 10–50 KB. Because it's event-driven rather than constant, the cost per phone is a few MB per game.
-- **Encryption:** the blob is **AES-GCM encrypted** with a key derived from a server secret (a Render environment variable that survives restarts) and the game code. Phones **store it but can't read it**, so a player can't dig hider or seeker positions out of their own phone's copy. GCM also makes tampering detectable. The server rejects blobs that fail authentication.
-- **On the phone:** the latest blob per game is written to a small local file (`SnapshotStore`), so it survives an app kill. It's deleted when the game ends.
-
-**Restoring**
-1. The server restarts with no memory. Every phone's socket drops, and the phones auto-reconnect with `rejoin {code, token, snapshotVersion}`.
-2. The server doesn't recognize the game and replies `need_restore`. It opens a short **restore window (~10 s)** for that game code and collects the snapshot versions the phones report.
-3. The server asks for the blob from the **leader's phone first**, and **the leader's snapshot wins** whenever the leader reconnects within the window. If the leader has lost signal or doesn't show up, the server uses the **highest-version** snapshot reported by any other phone.
-4. The phone sends `restore {code, version, blob}`. The server decrypts and validates it, rebuilds the game, increments `epoch`, and sends everyone a fresh `state_sync`.
-5. **Timers:** all timers are absolute timestamps, so countdowns continue. Missed pings during downtime collapse into **one** immediate ping, after which the schedule resumes. Out-of-bounds timers **and dark-hider timers** are reset, so players get a fair full grace period and nobody is converted just because the server was down.
-6. **Tracks:** the server lost its in-memory tracks, so every phone **re-uploads its full track from sequence 0** whenever it sees a new `epoch`. A 30-minute track is only ~70 KB per player.
-7. **Avatars and chat:** clients re-send their avatar on rejoin. Chat history is on each phone, so nothing is lost. Messages that the server was still relaying at the moment of the restart are re-sent from the senders' outboxes.
-
-**Limits**
-- If **every** phone is closed or offline during the restart, there's nothing to restore from and the game is lost. That's acceptable for friends-only games.
-- A malicious player could replay an old blob they hold, but they only hold ciphertext of their own game, and since the leader's snapshot wins, this is a non-issue among friends.
-- A restart before the first snapshot (lobby just created) simply loses the lobby, and players re-create the game.
-
----
-
-## 7. iOS App Design
-
-### 7.1 Stack
-- **Language/UI:** Swift 6 and SwiftUI, iOS 17+ target (new MapKit SwiftUI API, `@Observable`, Swift Charts).
-- **Maps:** MapKit with `MapCircle` for the geofence, `MapPolyline` for routes, and custom annotations (with avatars) for pins.
-- **Location:** CoreLocation.
-- **Charts:** Swift Charts for speed-over-time.
-- **Networking:** `URLSessionWebSocketTask` for the game socket. A small `GameClient` wraps it with auto-reconnect and exponential backoff. No third-party SDK is needed.
-- **Local storage:** `ProfileStore` (name, color, avatar), `TrackBuffer` (the current game's track, written to a file so it survives an app kill), `SnapshotStore` (the latest encrypted game snapshot for restart recovery), `ChatStore` (chat history and received media files, per game), and `HistoryStore` (saved results and chat, on-device only).
-- **Bundle ID:** `com.tarunpatanjali.hidenseek`. Sideloading tools usually rewrite it per Apple ID (§8.2), so it's mostly a label.
-- **Media (lossless only):** `PhotosPicker` and `AVCaptureSession` (in-app capture at 1080p HEVC). Strip GPS metadata from photos without re-encoding via `CGImageDestinationCopyImageSource`, and from videos with `AVAssetExportPresetPassthrough`. No resizing or transcoding. Saving to the Photos library uses `PHPhotoLibrary` with **add-only** access (`NSPhotoLibraryAddUsageDescription`), and GIFs are excluded. ⚠️ Verify these APIs when implementing.
-- **Architecture:** MVVM with a `GameClient`, a `LocationService`, and the stores above. Keep game logic out of views.
-- **Free-account limits:** no push notifications, no Associated Domains (universal links), and no iCloud/CloudKit. This design needs none of them.
-
-### 7.2 Background Location (the hardest iOS part)
-- Enable the *Location updates* background mode. ⚠️ Confirm it's allowed under a free personal team in your Xcode version (it normally is).
-- Request **When In Use** first, then upgrade to **Always** with a clear in-app explanation. Set `allowsBackgroundLocationUpdates = true` and `showsBackgroundLocationIndicator = true`.
-- **How it stays alive without push:** an active background location session keeps the app running, so the WebSocket stays open and location updates keep flowing. This must be tested on real devices early, because the Simulator is no help.
-- iOS can still suspend a WebSocket in some conditions. The client reconnects on resume and requests a `state_sync`. If the socket drops in the background, the track buffer keeps recording locally and uploads when the connection returns.
-- Local notifications cover "ping arrived" and "you're out of bounds" while backgrounded, but only while the app is running.
-
-### 7.3 GIFs
-- Use the **GIPHY API** (free developer key) through a server endpoint (`/gifs/search`) so the key isn't shipped in the app. Store only the GIF URL in the message. ⚠️ Free keys are rate-limited. Google has announced changes to the Tenor API, so check its status before choosing it.
-
-### 7.4 Key Screens
-Home (create / join) → **Profile & Settings** (name, photo, color, units, auto-save media toggle) → Lobby (players, roles, settings) → **Map** (main game view with HUD: countdown, next ping, role badge, own speed and distance) → Chat sheet (channel tabs) → Tag sheet → Settings (leader) → **Results** (stats, awards, routes map, speed chart, replay) → **Past games** (local).
-
-### 7.5 Transient Chat Relay on a Small Server
-The free Render service has ≈512 MB RAM and no persistent disk ⚠️, and chat/media live on the phones, so the server only needs a **short-lived in-memory relay**.
-- **No product limits, but safety ceilings:** the app doesn't limit photo or video size or length, but the server has to protect itself. The in-memory relay buffer is capped (~200 MB total) and a single file has a high ceiling (~150 MB, ⚠️ tune after testing). If the buffer is temporarily full, the sender's app shows "sending…" and retries automatically. A file above the ceiling fails with a clear message, which should be very rare with in-app 1080p recording.
-- **Lifetime:** a file is deleted once all authorized recipients have downloaded it, or after ~20 minutes. Text envelopes live ~10 minutes.
-- **Bandwidth:** lossless media is bigger than compressed media, and the server sends one copy per recipient. A 15 MB video sent to 20 players is ~300 MB of outbound traffic. Render's free plan includes limited monthly bandwidth ⚠️ (check the current number), so this adds up only if a lot of video is sent. Photos are small by comparison.
-- **Phone data use:** the same applies to players' cellular data. Videos download on tap, and photos download automatically.
-- **Phone storage:** media stays on each phone until the player deletes the game's chat or past game.
-- If bandwidth or memory ever becomes a problem, options are to introduce a video size cap, or to relay media through a free object store such as Cloudflare R2 ⚠️, which needs a card.
-
-### 7.6 Free-Server Limits to Respect
-- ~20 players sending `location` every ~4 s plus track batches every ~10 s is only a few messages per second. It's trivial for one Node process.
-- A soft cap of ~50 players per game and ~5 concurrent games protects the 512 MB budget.
-
----
-
-## 8. Hosting, Distribution & Cost
-
-### 8.1 Hosting
-
-| Component | Choice | Cost | Notes |
-|---|---|---|---|
-| Backend | **Render free web service** ⚠️ | $0 | ~750 instance-hours/mo. WebSockets supported. **Spins down after ~15 min without inbound traffic** (30–60 s cold start). Restarts can happen. ≈512 MB RAM. No persistent disk |
-| Cold-start mitigation | App calls `GET /health` on launch and on the Create/Join screen | $0 | Active games keep it awake through constant traffic ⚠️ verify that WebSocket traffic counts |
-| Maps | Apple MapKit | $0 | No API key |
-| GIFs | GIPHY | $0 | Free key, rate-limited |
-| Domain | `*.onrender.com` | $0 | Good enough for friends |
-
-### 8.2 Distribution without a paid Apple account
-
-You can't use TestFlight or Ad Hoc distribution without the $99 program. The free options all work by signing the app with **each phone owner's own free Apple ID**, which has these limits ⚠️:
-- Signed apps **expire after 7 days** and must be re-signed (refreshed).
-- A free Apple ID is limited to about **3 sideloaded apps at once** and a small number of new app IDs per week.
-- Each friend's iPhone needs **Developer Mode** turned on (Settings → Privacy & Security → Developer Mode, iOS 16+).
-- Sideloading tools re-sign the app and typically change the bundle ID (for example by adding a suffix tied to the friend's Apple ID). The app mustn't depend on its bundle ID at runtime.
-
-**Options, easiest first**
-
-| Method | How it works | Pros | Cons |
-|---|---|---|---|
-| **SideStore** (or AltStore) | You build an `.ipa`; each friend installs the sideloading app and uses it to install and refresh Hide n Seek with their own Apple ID | Free. SideStore can refresh on-device, while AltStore needs the friend's computer on the same Wi-Fi | Setup takes ~15–30 min per friend (needs a computer once for pairing). Needs weekly refresh |
-| **Sideloadly** | Friend installs the `.ipa` from a Windows/Mac computer using their Apple ID | Simple, one-off install | Same 7-day expiry, with manual re-install every week |
-| **Xcode from source** | Friends with Macs clone your GitHub repo and run it on their phone | No extra tools | Only works for friends with Macs and Xcode |
-
-**Practical plan**
-1. Build an unsigned `.ipa` (Xcode archive or `xcodebuild` with signing disabled) and host it as a **GitHub Release** (free). Friends download it and sideload it with their own Apple ID. The tool re-signs it for them.
-2. Before each game day, ask friends to **refresh the app** so it hasn't expired. Add an in-app "your build expires in N days" reminder if feasible.
-3. For a smoother experience, start with 3–5 close friends who are willing to do the setup. You can add more later.
-
-**Trade-offs and cost**
-- The weekly re-signing is the main pain point. If it becomes annoying, the $99/yr program (about $5 each if 20 friends split it) removes it, adds TestFlight links with 90-day builds, and unlocks push notifications and universal links. You've decided not to pursue it now, and nothing in the design depends on it.
-- **Not recommended:** enterprise certificate resellers (unreliable and risky, and the apps can be revoked without warning), and a web-only PWA (iOS Safari can't track location in the background, which breaks hiding).
-- Jailbreak/TrollStore options don't apply to a current iOS 17+ phone.
-
-### 8.3 Why not the alternatives for hosting
-- *Supabase:* would work, but needs anonymous auth, Row Level Security, and a cron scheduler. That's more machinery than an in-memory server for a 20-player friends game. It also pauses after a week idle.
-- *Oracle Always Free VM:* generous (up to 4 ARM cores / 24 GB RAM ⚠️), never sleeps, and has real disk. But it has capacity and idle-reclamation quirks, and you'd manage the OS, TLS, and updates. It's a good future move if Render's cold starts or restarts annoy you, and the same Node server would run there unchanged.
-- *Firebase:* Cloud Functions and Storage require the paid plan ⚠️, and per-read billing suits this poorly.
-
----
-
-## 9. Edge Cases to Design For
-
-- **Phone dies / loses signal:** the last known location is shown with "stale" age. The phone keeps recording its track and uploads it later, if it comes back before cleanup. A hider with no location for the dark-hider limit (default 2 min, leader setting) is auto-converted to a seeker (decision 30).
-- **Player closes or loses the app:** iOS may kill it. Show a "location sharing lost" indicator to the leader, and prompt the player to reopen. The track buffer file survives the kill, so the route can resume.
-- **Server cold start or restart:** see §6.6 and §8.1.
-- **Leader leaves or loses signal:** auto-promote another player.
-- **Changing settings mid-game:** shortening the duration below elapsed time ends the game. Moving the geofence may put players out of bounds immediately, so apply the grace period.
-- **Simultaneous tags:** handled by single-threaded processing, so the win check runs after each tag.
-- **Role changes and leaks:** a converted player immediately loses hider-channel and hider-live-location access (§6.4).
-- **Vehicles and GPS glitches:** samples over ~12 m/s are discarded from distance and top-speed calculations. A rider on a bike or in a car won't skew the stats, though the rest of their route still plots.
-- **Stat accuracy indoors:** indoor GPS jitter can add false distance, so the stationary filter in FR-39 matters. Make the thresholds tunable.
-- **Clock drift:** server time only.
-- **Same device in two games:** disallow, or switch contexts explicitly.
-- **Lost token:** if a player deletes the app and returns, they can only rejoin as a new player, since there's no account. The leader can reassign them.
-- **Missed chat:** a phone that's offline longer than the relay timeouts (~10 min for text, ~20 min for media) misses those messages. There is no backfill, by design.
-- **Phone storage:** lossless media can fill a phone over many games. Past games show their storage size and can be deleted.
-- **Expired sideload:** if a friend's build expires on game day, they can't launch the app. See §8.2.
-
----
-
-## 10. Privacy & Safety
-
-- Location is shared only **during an active game**, and only with players in that game.
-- Profile data and past-game results live on your device. The server holds the name, color, and a tiny avatar for the game's lifetime. The avatar is in memory only. Restart snapshots exist only as encrypted blobs on the players' own phones (§6.6), the server has no database, and **everything is deleted at cleanup** (FR-50).
-- Full routes are shared with all players of that game, but only after it ends (FR-45).
-- Write clear `NSLocationWhenInUseUsageDescription` and `NSLocationAlwaysAndWhenInUseUsageDescription` strings, and show a first-run explanation of what is shared and with whom, including that routes and speeds are recorded and revealed at the end.
-- Chat and media live on the players' phones. The server relays them transiently in memory and never writes them to disk. Photos and videos have **GPS metadata stripped** before sending, so they can't reveal a hiding spot.
-- Server logs should not contain coordinates, names, or message contents. Log only counts and errors.
-- Keep a leader "remove message / kick player" tool.
-- In-app safety reminders: obey traffic laws, stay off roads and private property, and no running into traffic. Provide an always-working "Leave game / stop sharing" button.
-- If any players are minors, make sure parents or guardians know about the location sharing.
-
----
-
-## 11. Suggested Roadmap
-
-| Phase | Goal | Contents |
-|---|---|---|
-| **0 – Spike** (≈1 wk) | Prove the hard parts | Minimal Node WebSocket server on Render. iOS app sends background GPS from a real phone and shows it live on a second phone's map. Test with the screen locked. Sideload one friend's phone with SideStore to confirm the install flow |
-| **1 – MVP** (2–4 wks) | One playable game | Local profile, create/join with code, lobby, manual roles, circle geofence, head start + 5-min pings, tagging, win conditions, text chat, rejoin via token, **local track recording + live speed/distance HUD** |
-| **2 – Full rules & stats** | Everything in §3 | Random assignment, out-of-bounds flow, live settings changes, team channels, photos/GIFs/video, **save-media-to-Photos prompt**, **track upload, stats, results map, speed chart, awards, past games** |
-| **3 – Resilience & polish** | Friends-ready | **device-held encrypted snapshots and restart recovery**, haptics/sound, onboarding, cold-start handling, expiry reminders, crash/reconnect hardening |
-| **4 – Later** | Nice to have | Replay scrubber, Live Activities, spectators, polygon geofences, power-ups; push and universal links if you ever buy the Apple account |
-
----
-
-## 12. Decisions Log
-
-| # | Decision |
+| Message | Purpose |
 |---|---|
-| 1 | Seekers who leave the area get a warning and a ping only, with no conversion |
-| 2 | A converted seeker gets the seeker view only |
-| 3 | Everyone sees the full roster with names and the remaining-hider count |
-| 4 | A tag is marked by the seeker alone, with no location or proximity check |
-| 5 | The leader can play or act as a referee |
-| 6 | ~~Videos capped at 15 seconds~~ Superseded by #25: no product limit |
-| 7 | Restarts are tolerated. Recovery uses encrypted snapshots held on the players' phones. The leader's snapshot wins, unless the leader has lost signal, in which case the highest version wins. No external database |
-| 8 | No paid Apple account, so friends sideload the app |
-| 9 | iOS 17+ only |
-| 10 | App name: **Hide n Seek** |
-| 11 | Speed, distance, and routes are tracked live, and shown with a results map at the end |
-| 12 | Seekers can't see hiders' live speed. Everyone's stats are revealed at the end |
-| 13 | Units default to mph, with a km/h toggle |
-| 14 | Static routes on the results map. The replay scrubber is deferred |
-| 15 | Past games are saved on-device by default |
-| 16 | Bundle ID: `com.tarunpatanjali.hidenseek` |
-| 17 | Chat and media are stored on devices. The server only relays them transiently |
-| 18 | Photos and videos are sent losslessly: no recompression, only GPS metadata is stripped |
-| 19 | 5-minute head start, then a ping when it ends and every 5 minutes. Everyone receives everyone's location at each ping. All of these are configurable |
-| 20 | Server language: TypeScript on Node (a single-threaded game loop avoids locking bugs) |
-| 21 | One repo with `/ios` and `/server` folders |
-| 22 | You'll create the GIPHY developer key |
-| 23 | The 30-minute hunt starts after the 5-minute head start (35 minutes total with defaults) |
-| 24 | During the head start each side sees only its own teammates. The first full ping fires when it ends |
-| 25 | No product limit on photo or video size or length. The server keeps a high safety ceiling |
-| 26 | No chat backfill for phones that were offline |
-| 27 | At the end of a game, the app offers to save all photos and videos (not GIFs) to the Photos library |
-| 28 | Saved media is limited to what each phone received, so team-only channel media is saved only by that team |
-| 29 | An **"Automatically save photos & videos to Photos"** toggle lives in the app's Settings/Profile page (off by default). When on, the end-of-game prompt is skipped |
-| 30 | Hiders who go dark (no location for ~2 min) are auto-converted to seekers, configurable |
-| 31 | Phase 0 assumptions (§13 B) are to be verified in the spike. Minor details (§13 C) are settled during the build |
+| `joined {code, playerId, token, epoch}` | Entry confirmed |
+| `state` | The player's filtered view of the game (section 4.4), sent immediately on structural changes and at most every 2 s for live positions |
+| `event` | Something happened: started, ping, out-of-bounds start or return, converted, paused, resumed, ended. Events are public |
+| `avatars` | Map of player id to small photo |
+| `chat`, `chat_ack` | An incoming message, and confirmation that the server took yours |
+| `track_ack` | How many route points the server holds for you |
+| `snapshot {version, blob}` | Encrypted restart snapshot |
+| `need_restore` | The server restarted and doesn't know this game. Send `restore` |
+| `game_over`, `results {version, results}` | The game ended, and the final results |
+| `error {message, fatal}` | A rejected command, or a fatal condition such as being removed |
 
-## 13. Still Open
+**HTTP**
 
-No product questions are waiting on you. These remain:
+| Route | Purpose |
+|---|---|
+| `GET /health` | Health check, also used by the app to wake the free server |
+| `POST /media` | Upload a photo or video to the relay. Returns `mediaId`. Authenticated with `x-code` and `x-token` headers |
+| `GET /media/:id` | Download media. Only a recipient who still needs it may fetch it |
+| `GET /gifs?q=` | GIPHY search proxy so the API key stays on the server |
 
-**A. Hiders going dark: DECIDED.** Hiders with no location update for ~2 minutes are auto-converted to seekers (leader setting, 0 = off). See decision 30.
+### 4.4 Visibility enforcement (anti-cheat)
 
-**B. Assumptions to verify in the phase 0 spike (marked ⚠️ above)**
-- Render's free tier keeps the instance awake while WebSockets and location traffic are flowing, and a mid-game restart really recovers from the phones' snapshots.
-- Background location keeps the socket alive with the screen locked, and works under a free Apple ID personal team.
-- Sideloading flow (SideStore/AltStore) works on a friend's iPhone, including the weekly refresh.
-- Render's free bandwidth and RAM are enough for lossless media, and the ~150 MB file ceiling is sensible.
-- GIPHY free-key limits are enough for 20 players.
-- GPS accuracy and the out-of-bounds jitter rule (FR-17) hold up outdoors and near buildings.
+Every outgoing game payload is built by `viewFor(playerId)`:
 
-**C. Small details I'll settle while building**
-- Minimum players and role counts needed to start (for example at least one hider and one seeker).
-- Exact pause/resume behavior, and what happens if the leader is the only referee and disconnects.
-- Media upload transport (a binary WebSocket frame or a separate HTTPS upload).
+- **Between pings:** a hider receives live hider positions, a seeker receives live seeker positions, a referee receives everyone.
+- **At a ping:** one ping carrying everyone's position goes to everyone.
+- **Speed** follows the same visibility as live position.
+- **Roster and counts** (names, roles, hiders left) go to everyone.
+- After a role change, the player's next `state` reflects their new role at once.
+- **Chat** is routed by the recipient's current role. A hider-channel message is never sent to a seeker.
+- **Routes and stats** are sent to everyone only after the game ends.
+
+If the app never receives the other team's coordinates, a modified client can't leak them.
+
+### 4.5 Chat and media relay
+
+Chat and media are held on the phones. The server only relays:
+
+1. A text or GIF message arrives as a `chat` message. The server checks the sender may post in that channel, works out which players may read it, and forwards it. Each recipient replies `chat_received`. When everyone has acknowledged, the server deletes it. Anything unacknowledged expires after **10 minutes**.
+2. **Photos and videos** are uploaded first with `POST /media`, then referenced by `mediaId` in a `chat` message. Recipients download with `GET /media/:id`. Media is deleted once all recipients have it, or after **20 minutes**. A file nobody references is dropped after 5 minutes.
+3. The sender keeps an outbox and re-sends text and GIFs the server hasn't acknowledged. A phone offline longer than the lifetimes above misses those messages. There is no backfill, by design.
+4. Safety ceilings for the 512 MB free server: **150 MB per file**, **200 MB total** buffered. If the buffer is full the upload returns 503 and the app retries.
+
+Media is **lossless**: the server stores and serves the exact bytes the phone uploaded.
+
+### 4.6 Tracks, results and timing
+
+- Each phone uploads its route in batches of up to 300 points. `track_batch {from}` is index-based, so re-sending after a dropout or restart is harmless: the server keeps only what it's missing and replies with its total, and the phone continues from there.
+- When the game ends, phones flush the rest of their routes and send `track_done`. The server builds the results when everyone connected has finished, or after **15 seconds**, whichever is first. A late `track_done` triggers a recomputed results message.
+- The results payload contains per-player stats, a simplified route (Ramer–Douglas–Peucker at 2 m, coordinates rounded to about 10 cm), a downsampled speed series, awards, pings, and events. Each phone saves it locally.
+
+### 4.7 Restart recovery
+
+Render can restart a free instance at any time, wiping memory. Instead of an external database, the phones hold the backup.
+
+**Saving.** On meaningful changes (and at least every 60 s), at most one per 3 s, the server builds a snapshot and sends it to every connected phone. It contains settings, timers, players (names, colors, roles, token hashes, last locations), pings and events. It does **not** contain avatars, chat, media, or routes. It is encrypted with **AES-256-GCM** using a key derived (HKDF) from the server's `SNAPSHOT_SECRET` and the game code, so phones store it but can't read it, and any tampering is detected.
+
+**Restoring.**
+1. After a restart each phone reconnects with `rejoin`. The server doesn't know the game, so it replies `need_restore` and opens a **6-second window**.
+2. Each phone answers `restore` with its token and its latest snapshot.
+3. The server decrypts the candidates. It only accepts a snapshot whose sender's token matches a member inside it. **The leader's snapshot wins** if the leader is present. Otherwise the highest version wins.
+4. The game is rebuilt, `epoch` increases by one, and every phone with a valid token is admitted. Timers continue from their absolute timestamps. Missed pings collapse into one. Dark-hider and out-of-bounds timers restart.
+5. Because routes aren't in the snapshot, each phone re-uploads its full route from index 0 (about 70 KB for 30 minutes). Avatars are re-sent, and chat history is already on the phones.
+
+If every phone is closed during the restart, nothing can restore the game. For a friends-only game this is accepted.
+
+### 4.8 Security and abuse protection
+
+- Tokens are random 128-bit values. The server stores only a SHA-256 hash, and a token is valid for one game.
+- Commands check the sender's token, role and the game state. Leader-only commands are rejected for anyone else.
+- Inputs are validated and clamped: names, colors, coordinates, settings, message sizes, batch sizes (600 points per batch, 20,000 per player), and avatar size.
+- Entry messages (create, join, rejoin, restore) are limited to 60 per minute per IP. Locations closer than 400 ms apart are ignored.
+- A WebSocket heartbeat every 20 seconds detects dead phones and stops proxies idling connections out.
+- All traffic is TLS (Render provides HTTPS and WSS). Join codes have about 887 million combinations.
+
+---
+
+## 5. iOS app design
+
+### 5.1 Structure
+
+| File | Responsibility |
+|---|---|
+| `HideNSeekApp.swift` | App entry, deep links, and which screen shows for the current game state |
+| `GameClient.swift` | The app's brain: WebSocket, session, game state, events, tracking, chat, snapshots, results |
+| `LocationService.swift` | CoreLocation with background updates |
+| `Models.swift` | Codable types matching the server's JSON, plus formatting |
+| `HomeView`, `LobbyView`, `GameView`, `ChatView`, `ResultsView` | Screens |
+| `Media.swift` | Lossless photo and video preparation, uploads and downloads, Photos saving, camera, GIF display, notifications |
+| `ProfileStore`, `ChatStore`, `Storage` | On-device storage |
+
+The app uses SwiftUI with the iOS 17 `@Observable` model. `GameClient` is the single source of truth, and views only display what it publishes.
+
+### 5.2 Screens and navigation
+
+The root view picks the screen from the game state: Home (no game), a connecting screen, Lobby, Game, or Results.
+
+- **Home:** profile, create or join, past games, profile and settings.
+- **Lobby:** join code and share, roster, role assignment, random roles, rules, play area, start.
+- **Game:** full-screen map with the play-area circle, live teammates, last-ping positions of everyone else, out-of-bounds markers, a HUD (role, countdown, next ping, hiders left, your speed and distance), Tag or "I'm out", chat, roster, and a leader menu.
+- **Chat:** channel tabs for the channels you may see, composer with photo/video, camera and GIF, unread badges.
+- **Results:** winner, media-save prompt, awards, and three tabs (routes map, stats, speed chart).
+
+### 5.3 Location and background operation
+
+- The app asks for When In Use, then Always, and runs a background location session (`UIBackgroundModes: location`, with the blue status indicator). That session keeps the app alive with the screen locked, so the WebSocket stays open without push notifications.
+- Location uses best accuracy and a 5 m distance filter. CoreLocation sends nothing while you stand still, so a timer re-sends the last fix at least every 15 seconds and records a stationary track point every 5 seconds.
+- If location permission is denied, the HUD warns that the player will be removed as a hider.
+
+### 5.4 Connection handling
+
+- The session (code, token, server, player id) is saved so killing the app and reopening it rejoins the game.
+- Reconnect uses exponential backoff (up to 15 s). A fresh create or join that can't reach the server gives up after 3 tries with a clear message.
+- A 10-second timer sends `ping`. If no `pong` arrives for 35 seconds the app drops the socket and reconnects, which catches half-dead connections iOS doesn't report.
+- Countdowns are computed from server timestamps and a measured clock offset, never from local timers alone.
+
+### 5.5 Local storage
+
+Everything for one game is in `Documents/Games/<CODE>/`:
+
+```
+chat.json      this game's messages
+media/         received and sent photos and videos
+track.json     this phone's full route (survives an app kill)
+snapshot.json  latest encrypted snapshot (deleted when the game ends)
+results.json   final results, which makes it a "past game"
+```
+
+Profile and preferences are in UserDefaults, with the avatar in Application Support. Leaving a game before it has results deletes its folder. Finished games stay until the player deletes them.
+
+### 5.6 Media pipeline
+
+- **Sending a photo:** the original bytes are copied through ImageIO without re-encoding and with GPS metadata excluded. If the location can't be removed, the photo isn't sent.
+- **Sending a video:** exported with the passthrough preset (no re-encode) with location metadata filtered out.
+- **In-app camera:** uses iOS's high-quality setting. A photo taken in-app is encoded once at maximum JPEG quality.
+- **Receiving:** photos download automatically, videos on tap. The phone acknowledges only after saving the file, and shows "no longer available" if the relay timed out.
+- **Thumbnails** are generated without decoding full-size files.
+- **GIFs** are GIPHY URLs shown with a small animated-GIF view. Nothing is stored on the server.
+- **Save to Photos** uses add-only permission, creates an album named "Hide n Seek – date", skips GIFs, and never saves the same item twice. The end screen asks, and a setting can auto-save.
+
+### 5.7 Permissions
+
+Location (When In Use and Always), local network (development), notifications, camera, microphone, and Photos (add-only). Each has a plain-language reason in `Info.plist`, generated from `project.yml`.
+
+### 5.8 Project generation
+
+The Xcode project is generated from `ios/project.yml` by XcodeGen and is not committed. Regenerating clears the signing team, which must be selected again in Xcode.
+
+---
+
+## 6. Hosting, distribution and cost
+
+| Component | Choice | Cost |
+|---|---|---|
+| Server | Render free web service, Node 22, blueprint in `render.yaml` | $0 |
+| Maps | Apple MapKit | $0 |
+| GIFs | GIPHY API (free beta key) through the server | $0 |
+| Code | GitHub | $0 |
+| App distribution | Sideloading with each friend's own free Apple ID | $0 |
+
+**Render free-tier behavior to design around** (verify current terms):
+- The service sleeps after about 15 minutes without traffic and takes up to a minute to wake. The app calls `/health` when opened to wake it early.
+- It can restart at any time, which section 4.7 handles.
+- About 512 MB RAM and no persistent disk, which shapes the in-memory design and media ceilings.
+- Limited monthly bandwidth. Lossless media is the main consumer: a 15 MB video sent to 20 players is about 300 MB.
+
+**Distribution without a paid Apple account.**
+- Apps signed with a free Apple ID **expire after 7 days** and must be refreshed. A free Apple ID allows only a few sideloaded apps at a time.
+- Friends install through SideStore, AltStore or Sideloadly, each signing with their own Apple ID, and turn on Developer Mode. Hosting the unsigned `.ipa` as a GitHub Release is the intended path.
+- Without a paid account there are no push notifications, no TestFlight, and no universal links, so invites use a custom URL scheme.
+- A web app (PWA) isn't viable: iOS Safari can't track location in the background.
+- The $99/year Apple Developer Program would remove the 7-day expiry and unlock TestFlight and push. It was deliberately declined.
+
+---
+
+## 7. Privacy and safety
+
+- Location is shared only during an active game, and only with players in it.
+- **Profile** (name, color, photo) is stored on the phone. A small 128 px version of the photo, plus name and color, goes to the server on joining and lives in memory only until cleanup.
+- **Chat, media, routes and past games** are stored on the phones. The server never writes them to disk.
+- **Restart snapshots** exist only as encrypted blobs on the phones. The server keeps no database.
+- **Cleanup:** an ended game is kept about 30 minutes so everyone can fetch results, then deleted. Idle games are deleted after 30 minutes with nobody connected.
+- **Photos and videos** have GPS metadata removed so they can't reveal a hiding spot. Routes are revealed to everyone only after the game ends.
+- Server logs contain no coordinates, names or message contents.
+- Safety: obey traffic laws, stay off roads and private property. A "Leave game" control is always available. If any players are minors, their guardians should know about the location sharing.
+
+---
+
+## 8. Testing and verification
+
+**Automated (26 tests, `npm test`)**
+- Rules engine (16): validation to start, the 35-minute timeline and ping times, pings carrying everyone, visibility between and at pings, a tagged hider's view, tagging rules and win condition, out-of-bounds with GPS noise and grace, seekers never converted, offline hiders, late pings after a restart, settings changes mid-game, random roles, referee view, nothing mutable after the end.
+- Stats (7): distance and speed, glitch and accuracy filtering, jitter, hider/seeker distance split, route simplification, downsampling.
+- End to end over real WebSockets and HTTP (3): a full game from lobby to results (roles, settings, head start, pings, visibility, tagging, chat channel privacy, lossless media relay with deletion after delivery, route upload edge cases, results); lobby behavior (random roles, bad codes and tokens, kick, late join rules, pause, leader hand-over, malformed input); and restart recovery (snapshot handback, leader wins over a staler snapshot, tampered or wrong-key snapshots rejected, route re-upload).
+
+**Also verified**
+- The server builds and runs in production mode.
+- The iOS app compiles for iPhone with no errors or warnings.
+- The app's Swift models decode real server messages from a played game.
+- The app ran on a real iPhone against a local server, and the Render deployment answered its health check. A full multi-phone game on Render has not been played yet.
+
+**Not covered by automation:** the SwiftUI screens themselves, background location with the screen locked, the camera, Photos saving, GIF search, Render's free-tier behavior over time, and the sideloading flow on friends' phones. Check these on real devices.
+
+---
+
+## 9. Design decisions
+
+| Decision | Why | Alternatives considered |
+|---|---|---|
+| Native SwiftUI app, iOS only | Best background location and MapKit behavior | Cross-platform frameworks: not needed |
+| Custom authoritative Node server | Hidden information, timers and per-player views are simplest in one process | Supabase or Firebase: need row-level rules, a scheduler, and anonymous auth. Firebase's functions and storage need a paid plan |
+| In-memory game state, no database | Games are short-lived, and the server is trivially simple | An external database for restart recovery |
+| Encrypted snapshots held by the phones | Restart recovery with no database or extra account | Neon free Postgres (considered, then replaced) |
+| Render free tier | Free, supports WebSockets, simple deploy | Oracle Always Free VM: generous but capacity, idle-reclamation and ops burden. It remains a fallback, and the same server runs there unchanged |
+| TypeScript on Node | A single-threaded game loop avoids locking bugs, with fast iteration | Go: lower memory but needs locks around shared state |
+| Pings show everyone to everyone | Fair, simple, and keeps both sides in play | Role-specific pings (the first idea) |
+| Head start first, then a 30-minute hunt | The hunt keeps its full length regardless of head start | Counting the head start inside the 30 minutes |
+| Server-side visibility filtering | A modified app can't read what it never receives | UI-only hiding |
+| Seekers aren't converted for leaving the area | They're already seekers. They get a warning and the alert | Converting or penalizing seekers |
+| Offline hiders convert to seekers after 2 minutes | Prevents going dark to avoid pings | Honor system; showing a stale marker |
+| Tagging has no proximity check | The group wanted it simple | A distance requirement |
+| Chat and media held only on phones, relayed transiently | Privacy, and the free server has no storage | Storing media on the server or Cloudflare R2 |
+| Lossless media, no app-side limits, GPS stripped | The group asked for no compression. Stripping location is a lossless privacy requirement | 720p transcoding and size caps (the first plan) |
+| No chat backfill | Accepted for simplicity | Phones syncing from each other |
+| Index-based route upload | Makes re-sending idempotent after dropouts and restarts | Sequence-numbered batches |
+| GIPHY via the server | Keeps the API key out of the app | Tenor, whose API is changing |
+| Profile on the phone, no sign-in | The group wanted no accounts | Anonymous server accounts |
+| Past games saved on the phone | Matches the device-only data model | Server history |
+| Sideloading with free Apple IDs | The group declined the $99 program | TestFlight, a PWA |
+| Custom URL scheme for invites | Universal links need a paid account | Universal links |
+| mph by default, km/h optional | The group's preference | |
+| Static routes map, no replay (yet) | Enough for v1 | Animated replay |
+| Auto-save media is an optional setting, off by default | Asking first avoids filling the Photos library | Always auto-save |
+| Bundle ID `com.tarunpatanjali.hidenseek` | Chosen by the owner | |
+
+**Changed during the build**
+- Restart snapshots moved from an external database to the phones.
+- Video limits (15 seconds) and recompression were removed in favor of lossless sending.
+- Head start changed from 0 to 5 minutes and became a first-class part of the timeline.
+- Dark-hider conversion was added after the loophole was found.
+- The route upload protocol changed from numbered batches to index-based batches.
+- In-app video recording uses iOS's high-quality setting instead of an explicit 1080p, which the simple camera API doesn't offer.
+
+---
+
+## 10. Known limitations and unverified assumptions
+
+**Limitations**
+- Free Apple ID builds expire every 7 days, so friends must refresh before a game.
+- The free Render server sleeps and can restart. A restart is recovered from the phones' snapshots, but if every phone is closed at that moment, the game is lost.
+- No push notifications. If iOS suspends the app, updates can be delayed until it wakes.
+- Continuous GPS drains the battery.
+- Phones offline for more than about 10 to 20 minutes miss chat sent meanwhile.
+- The GIPHY beta key has a low hourly limit.
+- A file over 150 MB can't be relayed by the free server.
+- A modified app could still hold a legitimately received hider chat history after being converted. This is hidden by the UI only, and accepted among friends.
+
+**Assumptions to confirm over time**
+- Render keeps an active game's instance awake, and its free-tier limits (bandwidth, sleep, restarts) hold up.
+- Background location reliably keeps reporting with the screen locked for a full game, including on a friend's older iPhone.
+- The sideloading flow (SideStore or AltStore) works smoothly for friends, including the weekly refresh.
+- GPS accuracy and the out-of-bounds noise rule behave well near buildings and trees.
+
+**Possible future work**
+- Animated replay of a finished game.
+- Live Activities and the Dynamic Island countdown.
+- Letting players choose their own role in the lobby.
+- Polygon play areas, spectators, and power-ups.
+- Push notifications and TestFlight, if a paid Apple account is ever bought.
